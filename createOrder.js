@@ -80,4 +80,73 @@ app.post('/api/capture-paypal-order', async (req, res) => {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer
+      'Authorization': `Bearer ${accessToken}`
+    }
+  }).then(r => r.json());
+
+  if (capture.error) {
+    // Rollback stock if capture fails
+    const order = ORDERS.find(o => o.paypalOrderID === orderID);
+    if (order) {
+      order.items.forEach(item => {
+        PRODUCTS[item.productId].stock += item.qty;
+      });
+    }
+    return res.status(400).json({ error: capture.error });
+  }
+
+  // Store confirmed order
+  const newOrder = {
+    id: uuid(),
+    paypalOrderID: orderID,
+    userId: capture.payer.payer_id,
+    items: capture.purchase_units[0].items,
+    total: parseFloat(capture.purchase_units[0].payments.captures[0].amount.value),
+    currency: 'USD',
+    status: 'CONFIRMED',
+    createdAt: new Date().toISOString()
+  };
+  ORDERS.push(newOrder);
+
+  res.json(newOrder);
+});
+
+// ---- PayPal auth helper ----
+async function getPayPalAccessToken() {
+  const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+  const res = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'grant_type=client_credentials'
+  });
+  const json = await res.json();
+  return json.access_token;
+}
+
+// ---- client SDK snippet (for frontend) ----
+/*
+<script src="https://www.paypal.com/sdk/js?client-id=YOUR_CLIENT_ID&currency=USD"></script>
+<script>
+  paypal.Buttons({
+    createOrder: () => fetch('/api/create-paypal-order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: 'user_42', cart: [...] })
+    }).then(res => res.json()).then(data => data.orderID),
+    onApprove: (data) => fetch('/api/capture-paypal-order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orderID: data.orderID })
+    }).then(res => res.json()).then(order => alert(`Order ${order.id} confirmed!`))
+  }).render('#paypal-button-container');
+</script>
+*/
+
+// ---- start server ----
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🛒 PayPal Ecommerce server listening on http://localhost:${PORT}`);
+});
