@@ -1,6 +1,10 @@
 // createOrder.js
-// A self-contained, in-memory e-commerce order creator
+// E-commerce checkout with PayPal Orders API
+const express = require('express');
 const { v4: uuid } = require('uuid');
+const fetch = require('node-fetch');
+const app = express();
+app.use(express.json());
 
 // ---- fake catalog ----
 const PRODUCTS = {
@@ -9,63 +13,140 @@ const PRODUCTS = {
   103: { id: 103, name: 'MongoDB Sticker Pack', price: 5.5, stock: 100 }
 };
 
-// ---- cart shape expected by createOrder ----
-const sampleCart = [
-  { productId: 101, qty: 2 },   // 2 t-shirts
-  { productId: 103, qty: 1 }    // 1 sticker pack
-];
+// ---- PayPal config ----
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || 'YOUR_CLIENT_ID';
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || 'YOUR_CLIENT_SECRET';
+const PAYPAL_BASE = 'https://api-m.sandbox.paypal.com';
 
-/**
- * Creates an order from a shopping-cart.
- * @param {string} userId  – any string to identify the user
- * @param {Array<{productId:number, qty:number}>} cart
- * @param {string} paymentIntentId – fake payment id
- * @returns {Order}
- */
-function createOrder(userId, cart, paymentIntentId = 'pi_mock') {
+const ORDERS = [];
+
+app.post('/api/create-paypal-order', async (req, res) => {
+  const { userId, cart } = req.body;
+
   let total = 0;
   const items = [];
 
+  // Validate and calculate
   for (const { productId, qty } of cart) {
     const product = PRODUCTS[productId];
-    if (!product) throw new Error(`Product ${productId} not found`);
-    if (qty > product.stock) throw new Error(`Not enough stock for ${product.name}`);
+    if (!product) return res.status(400).json({ error: 'Product not found' });
+    if (qty > product.stock) return res.status(400).json({ error: `Not enough stock for ${product.name}` });
 
     items.push({
-      productId,
       name: product.name,
-      price: product.price,
-      qty,
-      subtotal: product.price * qty
+      unit_amount: { currency_code: 'USD', value: product.price.toFixed(2) },
+      quantity: qty.toString()
     });
     total += product.price * qty;
-    product.stock -= qty; // mutate in-memory stock
   }
 
-  const order = {
+  const totalStr = total.toFixed(2);
+
+  // Create PayPal order
+  const accessToken = await getPayPalAccessToken();
+  const order = await fetch(`${PAYPAL_BASE}/v2/checkout/orders`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      intent: 'CAPTURE',
+      purchase_units: [{
+        reference_id: uuid(),
+        amount: {
+          currency_code: 'USD',
+          value: totalStr,
+          breakdown: {
+            item_total: { currency_code: 'USD', value: totalStr }
+          }
+        },
+        items
+      }]
+    })
+  }).then(r => r.json());
+
+  // Reserve stock
+  cart.forEach(({ productId, qty }) => PRODUCTS[productId].stock -= qty);
+
+  res.json({ orderID: order.id });
+});
+
+app.post('/api/capture-paypal-order', async (req, res) => {
+  const { orderID } = req.body;
+  const accessToken = await getPayPalAccessToken();
+
+  const capture = await fetch(`${PAYPAL_BASE}/v2/checkout/orders/${orderID}/capture`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${accessToken}`
+    }
+  }).then(r => r.json());
+
+  if (capture.error) {
+    // Rollback stock if capture fails
+    const order = ORDERS.find(o => o.paypalOrderID === orderID);
+    if (order) {
+      order.items.forEach(item => {
+        PRODUCTS[item.productId].stock += item.qty;
+      });
+    }
+    return res.status(400).json({ error: capture.error });
+  }
+
+  // Store confirmed order
+  const newOrder = {
     id: uuid(),
-    userId,
-    items,
-    total: Number(total.toFixed(2)),
+    paypalOrderID: orderID,
+    userId: capture.payer.payer_id,
+    items: capture.purchase_units[0].items,
+    total: parseFloat(capture.purchase_units[0].payments.captures[0].amount.value),
     currency: 'USD',
-    paymentIntentId,
     status: 'CONFIRMED',
     createdAt: new Date().toISOString()
   };
+  ORDERS.push(newOrder);
 
-  // persist in memory (lost on restart)
-  ORDERS.push(order);
-  return order;
+  res.json(newOrder);
+});
+
+// ---- PayPal auth helper ----
+async function getPayPalAccessToken() {
+  const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+  const res = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'grant_type=client_credentials'
+  });
+  const json = await res.json();
+  return json.access_token;
 }
 
-// ---- simple in-memory store ----
-const ORDERS = [];
+// ---- client SDK snippet (for frontend) ----
+/*
+<script src="https://www.paypal.com/sdk/js?client-id=YOUR_CLIENT_ID&currency=USD"></script>
+<script>
+  paypal.Buttons({
+    createOrder: () => fetch('/api/create-paypal-order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: 'user_42', cart: [...] })
+    }).then(res => res.json()).then(data => data.orderID),
+    onApprove: (data) => fetch('/api/capture-paypal-order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orderID: data.orderID })
+    }).then(res => res.json()).then(order => alert(`Order ${order.id} confirmed!`))
+  }).render('#paypal-button-container');
+</script>
+*/
 
-// ---- demo run ----
-try {
-  const order = createOrder('user_42', sampleCart);
-  console.log('✅ Order created:\n', JSON.stringify(order, null, 2));
-  console.table(order.items);
-} catch (err) {
-  console.error('❌', err.message);
-}
+// ---- start server ----
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🛒 PayPal Ecommerce server listening on http://localhost:${PORT}`);
+});
